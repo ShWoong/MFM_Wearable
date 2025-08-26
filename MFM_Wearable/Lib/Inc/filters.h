@@ -25,8 +25,8 @@ float STRETCH_SENSOR(void);
 float EMG_SENSOR(void);
 void FIR_Init(int num_taps, float cutoff_freq, float fs);
 float FIR_Process(float input);
-float MAF(float new_sample);
-double MAFEMG(double new_sample);
+float MAFTemp(float new_sample);
+double MAFPower(double new_sample);
 float EWMAF(float new_measurement, float prev_ewma, float alpha);
 float IntegralFilter(float input, float *prev_output, float alpha);
 
