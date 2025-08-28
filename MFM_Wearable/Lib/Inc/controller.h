@@ -8,102 +8,82 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ---------------------------
- * Plant/Controller parameters
- * ---------------------------
- * 단위:
- *  - Kp_proc : [K/W] (정상상태 온도상승 / 전력)
- *  - tau     : [s]
- *  - theta   : [s] (dead-time)
- *  - lambda  : [s] (IMC 튜닝 → Kc 계산)
- *  - Ti      : [s] (적분시간, 권장 τ)
- *  - Tt      : [s] (anti-windup tracking time, back-calculation)
- *  - Ts      : [s] (샘플링)
- *  - u_min_W, u_max_W : [W]
- *  - Kff     : [-] (FF 스케일)
- *
- *  - lam_ref : [s] (참조 성형용; 0이면 lambda 사용)
- *  - use_dyn_ff : 동적 역모델 FF 사용 여부
- *
- * Safety/추정:
- *  - T_soft_max / T_hard_off / T_hard_rst : [°C]
- *  - track_tau_s : [s] (주변온도 추정 LPF)
- *  - p_off_w : [W] (주변 추정 허용 전력)
- *  - duty_off : [0..1]
- *  - latch_samples : (예비)
- */
+/* 외부(온도) 루프 파라미터 — 대표 튜닝은 lambda 하나만 */
 typedef struct {
-  float Kp_proc;
-  float tau;
-  float theta;
+  /* 공정 모델 */
+  float Kp_proc;      // [K/W]
+  float tau;          // [s]
+  float theta;        // [s]
 
-  float lambda;
-  float Kc;     // = tau / (Kp_proc*(lambda+theta))
-  float Ti;     // = tau
-  float Tt;     // anti-windup tracking time
-  float Ts;
+  /* IMC/PI 파라미터 (lambda만 외부 입력, 나머지는 자동계산) */
+  float lambda;       // [s]  ★ 대표 파라미터
+  float Kc;           // [W/K]  = tau / (Kp_proc*(lambda+theta))
+  float Ti;           // [s]    = tau
+  float Tt;           // [s]    ≈ 0.2*lambda (anti-windup back-calculation)
+  float Ts;           // [s]    샘플링(외루프, 0.01s)
 
-  float u_min_W;
-  float u_max_W;
+  /* 전력 제한 */
+  float u_min_W;      // [W]
+  float u_max_W;      // [W]
 
-  float Kff;        // feedforward gain (scale)
+  /* 역모델 Feedforward */
+  float Kff;          // [-]  (0이면 미사용)
 
-  /* NEW: 모델기반 옵션 */
-  float lam_ref;    // 0 → lambda 사용
-  bool  use_dyn_ff; // true: 역모델 FF 활성
+  /* 참조 성형/옵션 */
+  float lam_ref;      // [s]  (0 → lambda 사용)
+  bool  use_dyn_ff;   // true면 dead-time 보상(선택)
+  int   theta_samp_max; // dead-time 버퍼 한도 (samples)
 
   /* Safety */
-  float T_soft_max;
-  float T_hard_off;
-  float T_hard_rst;
+  float T_soft_max;   // [°C] 소프트 리밋(목표 클램프)
+  float T_hard_off;   // [°C] 하드오프 래치 온
+  float T_hard_rst;   // [°C] 하드오프 래치 해제
 
-  /* Ambient estimation */
-  float track_tau_s;
-  float p_off_w;
-  float duty_off;
-  uint16_t latch_samples;
+  /* 주변온도 추정 */
+  float track_tau_s;  // [s]
+  float p_off_w;      // [W]
+  float duty_off;     // [0..1]
 } ControllerParams;
 
-/* ---------------------------
- * Controller runtime states
- * --------------------------- */
+/* 외부(온도) 루프 상태 */
 typedef struct {
-  /* PI integrator state */
-  float i_term_W;
-
-  /* Ambient temperature estimate */
-  float Tamb_hat;
-
-  /* Latches / flags */
+  float i_term_W;     // PI 적분 상태(전력 명령 단위)
+  float Tamb_hat;     // 주변온도 추정
   bool  hard_off_latch;
 
-  /* Telemetry */
-  float u_noaw_W;   // FF+PI (AW 전)
-  float u_cmd_W;    // 최종 전력 명령
+  /* 텔레메트리 */
+  float u_noaw_W;
+  float u_cmd_W;
   float duty_last;
 
-  /* NEW: 역모델 FF/참조 성형 상태 */
-  float Td_f;       // 성형된 참조
-  float Td_prev;    // 직전 Td_f
-  float Pff_W;      // FF 전력(전송/로그용)
+  /* 참조 성형/지연 보상 */
+  float Td_f;
+  float Td_prev;
+  float Pff_W;
 
-  int   theta_samp; // dead-time 샘플 수
-  int   rb_head;    // 링버퍼 인덱스
-  /* 최대 8 s @ 100 Hz = 800 샘플 */
-  float Td_rb[800];
+  int   theta_samp;
+  int   rb_head;
+  float Td_rb[800];   // 최대 8s @100Hz
 } ControllerState;
 
 /* 초기화 */
 void Controller_Init(const ControllerParams* p, ControllerState* s);
 
-/* (옵션) 적분기 리셋 */
-static inline void Controller_ResetIntegrator(ControllerState* s){
-  if (s) s->i_term_W = 0.0f;
-}
+/* 대표 파라미터 재튜닝(λ만 입력, 종속 파라미터 자동 계산) */
+void Controller_SetLambda(ControllerParams* p, ControllerState* s, float lambda);
 
-/* 1스텝 업데이트
- * 입력 : Tset, Tmeas, P_meas_W, Vrms, R_est
- * 출력 : duty_out(0..1), u_des_W(전력명령)
+/* 공정모델 변경(드물게) */
+void Controller_UpdatePlant(ControllerParams* p, ControllerState* s,
+                            float Kp_proc, float tau, float theta);
+
+/* (옵션) FF 게인 변경 */
+static inline void Controller_SetKff(ControllerParams* p, float kff){ if (p && kff >= 0.0f) p->Kff = kff; }
+
+/* 적분기 리셋 */
+static inline void Controller_ResetIntegrator(ControllerState* s){ if (s) s->i_term_W = 0.0f; }
+
+/* 1스텝(외부 루프): Tset/Tmeas -> u_des_W(전력 목표)
+ * duty_out은 텔레메트리 힌트일 뿐, 실제 듀티는 내부 전력루프가 결정
  */
 void Controller_Step(const ControllerParams* p, ControllerState* s,
                      float Tset, float Tmeas, float P_meas_W,
@@ -113,5 +93,4 @@ void Controller_Step(const ControllerParams* p, ControllerState* s,
 #ifdef __cplusplus
 }
 #endif
-
 #endif /* CONTROLLER_H */
